@@ -1,10 +1,8 @@
-/* 아발론 온라인 - 화면 & P2P 네트워크 (PeerJS) */
+/* 아발론 온라인 - 화면 & 네트워크 (MQTT 공개 중계 서버, WebSocket) */
 (function () {
   'use strict';
   const A = window.Avalon;
-  const PEER_PREFIX = 'avalon-kr-online-';
   const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const NET_ERRORS = ['network', 'server-error', 'socket-error', 'socket-closed'];
 
   const $ = (s) => document.querySelector(s);
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -21,7 +19,7 @@
     return c;
   }
   function newId() {
-    return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36);
+    return (window.crypto && crypto.randomUUID) ? crypto.randomUUID().replace(/-/g, '') : Math.random().toString(36).slice(2) + Date.now().toString(36);
   }
   function getCid() {
     let c = store.get('avalon-cid', sessionStorage);
@@ -31,10 +29,8 @@
 
   const app = {
     mode: 'home', // home | host | client
+    session: 0,
     cid: getCid(),
-    peer: null,
-    conn: null,
-    conns: new Map(),
     state: null,
     view: null,
     code: '',
@@ -43,10 +39,163 @@
     roleHidden: true,
     selection: [],
     selKey: '',
-    everConnected: false,
-    reconnectTimer: null,
-    hostRetry: 0,
+    // host
+    clients: new Map(), // pid -> {cid, seen}
+    kicked: new Set(),
+    ver: 0,
+    epoch: '',
+    // client
+    joined: false,
+    info: null,
+    viewEpoch: '',
+    viewVer: -1,
+    hostSeen: 0,
+    t0: 0,
+    lastHello: 0,
   };
+
+  /* ---------------- 네트워크: 공개 MQTT 중계 서버 ----------------
+     여러 중계 서버에 동시에 접속하고 모든 서버로 메시지를 보냅니다.
+     두 사람이 공통으로 닿는 서버가 하나만 있어도 게임이 됩니다. */
+  const PROTO = 2;
+  const NS = 'avalon-kr-online';
+  const ROOMS = `${NS}/rooms/`;
+  const roomBase = (code) => `${NS}/room/${code}`;
+  const BROKERS = [
+    { u: 'wss://broker.emqx.io:8084/mqtt' },
+    { u: 'wss://mqtt.eclipseprojects.io:443/mqtt' },
+    { u: 'wss://public.cloud.shiftr.io', o: { username: 'public', password: 'public' } },
+    { u: 'wss://broker.hivemq.com:8884/mqtt' },
+    { u: 'wss://test.mosquitto.org:8081/mqtt' },
+  ];
+  const PAGE_ID = Math.random().toString(36).slice(2, 10);
+  const NET = { clis: [], pending: [], seen: new Set(), seq: 0, onConnect: null };
+
+  const netUp = () => NET.clis.filter((c) => c.connected).length;
+  function netEnd() {
+    [...NET.clis, ...NET.pending].forEach((c) => { try { c.end(true); } catch (e) { /* ignore */ } });
+    NET.clis = [];
+    NET.pending = [];
+    NET.onConnect = null;
+  }
+  function rawPub(topic, payload, retain) {
+    for (const c of NET.clis) if (c.connected) { try { c.publish(topic, payload, { qos: 0, retain: !!retain }); } catch (e) { /* ignore */ } }
+  }
+  function pub(topic, m, retain) {
+    rawPub(topic, JSON.stringify(Object.assign({}, m, { _i: `${PAGE_ID}.${++NET.seq}` })), retain);
+  }
+  function parseMsg(txt) {
+    let m;
+    try { m = JSON.parse(txt); } catch (e) { return null; }
+    if (!m || typeof m !== 'object') return null;
+    if (m._i) {
+      if (NET.seen.has(m._i)) return null;
+      NET.seen.add(m._i);
+      if (NET.seen.size > 5000) NET.seen = new Set([...NET.seen].slice(-2500));
+    }
+    return m;
+  }
+  function netAvailable() {
+    if (!window.mqtt) { toast('통신 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침해주세요.'); return false; }
+    return true;
+  }
+  // 모든 중계 서버에 접속. 첫 서버가 연결되면 resolve (나머지는 뒤에서 계속 연결)
+  function netConnect(will, topics, onMsg) {
+    const q = new URLSearchParams(location.search).get('broker');
+    const list = q ? [{ u: q }] : BROKERS;
+    NET.pending = [];
+    return new Promise((res, rej) => {
+      let left = list.length;
+      let done = false;
+      const failOne = () => { if (--left === 0 && !done) { done = true; rej(new Error('no broker')); } };
+      for (const b of list) {
+        let cli;
+        let up = false;
+        const opts = Object.assign({}, b.o || {}, {
+          clientId: `av${PAGE_ID}${Math.random().toString(36).slice(2, 6)}`,
+          clean: true, keepalive: 20, reconnectPeriod: 3000, connectTimeout: 9000,
+        });
+        if (will) opts.will = will;
+        try { cli = mqtt.connect(b.u, opts); } catch (e) { failOne(); continue; }
+        NET.pending.push(cli);
+        cli.on('error', () => {});
+        cli.on('connect', () => {
+          if (!up) {
+            up = true;
+            NET.clis.push(cli);
+            cli.subscribe(topics);
+            cli.on('message', (tp, buf) => onMsg(tp, buf.toString()));
+          }
+          if (NET.onConnect) NET.onConnect();
+          if (!done) { done = true; res(); }
+        });
+        setTimeout(() => { if (!up) { try { cli.end(true); } catch (e) { /* ignore */ } failOne(); } }, 10000);
+      }
+    });
+  }
+
+  /* ---------------- 공개 방 목록 ---------------- */
+  const BROWSE = { clis: [], rooms: new Map(), on: false };
+  function startBrowse() {
+    if (BROWSE.on || !window.mqtt) return;
+    BROWSE.on = true;
+    BROWSE.rooms.clear();
+    for (const b of BROKERS) {
+      let cli;
+      try {
+        cli = mqtt.connect(b.u, Object.assign({}, b.o || {}, {
+          clientId: `avb${Math.random().toString(36).slice(2, 10)}`, clean: true, keepalive: 30, reconnectPeriod: 4000, connectTimeout: 9000,
+        }));
+      } catch (e) { continue; }
+      BROWSE.clis.push(cli);
+      cli.on('error', () => {});
+      cli.on('connect', () => { cli.subscribe(`${ROOMS}+`); renderRooms(); });
+      cli.on('message', (tp, buf) => {
+        const code = tp.slice(ROOMS.length);
+        const txt = buf.toString();
+        if (!txt) { BROWSE.rooms.delete(code); renderRooms(); return; }
+        let m;
+        try { m = JSON.parse(txt); } catch (e) { return; }
+        if (!m || m.t !== 'room') return;
+        const old = BROWSE.rooms.get(code);
+        if (!old || m.ts >= old.ts) BROWSE.rooms.set(code, m);
+        renderRooms();
+      });
+    }
+  }
+  function stopBrowse() {
+    BROWSE.on = false;
+    BROWSE.clis.forEach((c) => { try { c.end(true); } catch (e) { /* ignore */ } });
+    BROWSE.clis = [];
+  }
+  setInterval(() => { if (BROWSE.on) renderRooms(); }, 2000);
+
+  function renderRooms() {
+    const el = $('#roomList');
+    if (!el || app.mode !== 'home') return;
+    const up = BROWSE.clis.filter((c) => c.connected).length;
+    const now = Date.now();
+    const list = [...BROWSE.rooms.values()]
+      .filter((m) => m.v === PROTO && !m.gone && Math.abs(now - m.ts) < 20000)
+      .sort((a, b) => (a.state === 'game') - (b.state === 'game') || b.ts - a.ts);
+    const cnt = $('#roomCnt');
+    if (cnt) cnt.textContent = up ? `${list.length}개` : '';
+    if (!list.length) {
+      el.innerHTML = `<div class="empty">${up ? '아직 열린 방이 없어요. 방을 만들어 친구들을 초대해보세요!' : '방 목록 서버에 연결하는 중...'}</div>`;
+      return;
+    }
+    el.innerHTML = list.map((m) => {
+      const full = m.n >= A.MAX_PLAYERS;
+      const game = m.state === 'game';
+      const need = Math.max(0, A.MIN_PLAYERS - m.n);
+      return `<div class="roomrow">
+        <div class="rinfo"><b>${esc(m.host)}의 방</b>
+          <small>#${esc(m.code)} · ${game ? '⚔️ 게임 중' : (need ? `⏳ 대기 중 · ${need}명 더 필요` : '⏳ 대기 중 · 시작 가능')}</small></div>
+        <span class="rcount ${m.n < A.MIN_PLAYERS ? 'short' : ''}">👥 ${m.n}/${A.MAX_PLAYERS}</span>
+        <button class="mini ${game || full ? '' : 'primary'}" data-act="joinRoom" data-code="${esc(m.code)}" ${full && !game ? 'disabled' : ''}>${game ? '재입장' : (full ? '만석' : '입장')}</button>
+      </div>`;
+    }).join('');
+  }
 
   /* ---------------- 공통 ---------------- */
   let toastTimer = null;
@@ -55,23 +204,19 @@
     el.textContent = msg;
     el.hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { el.hidden = true; }, 3200);
-  }
-
-  function safeSend(conn, msg) {
-    try { if (conn && conn.open) conn.send(msg); } catch (e) { console.warn(e); }
+    toastTimer = setTimeout(() => { el.hidden = true; }, 3500);
   }
 
   function teardown() {
-    clearTimeout(app.reconnectTimer);
-    app.reconnectTimer = null;
-    if (app.peer) { const p = app.peer; app.peer = null; try { p.destroy(); } catch (e) { /* ignore */ } }
-    app.conn = null;
-    app.conns = new Map();
+    app.session += 1;
+    netEnd();
     app.view = null;
     app.state = null;
     app.status = '';
     app.selection = [];
+    app.clients = new Map();
+    app.joined = false;
+    app.info = null;
   }
 
   function goHome(msg) {
@@ -81,25 +226,41 @@
     if (msg) toast(msg);
   }
 
-  function peerAvailable() {
-    if (typeof window.Peer === 'undefined') {
-      toast('통신 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침해주세요.');
-      return false;
-    }
-    return true;
-  }
-
   function inviteLink(code) {
     return `${location.origin}${location.pathname}?room=${code}`;
   }
 
+  let wakeLock = null;
+  async function keepAwake() {
+    try {
+      if ('wakeLock' in navigator && !document.hidden && app.mode !== 'home' && (!wakeLock || wakeLock.released)) wakeLock = await navigator.wakeLock.request('screen');
+    } catch (e) { /* ignore */ }
+  }
+
   /* ---------------- 호스트 ---------------- */
-  function hostStart(name, restore) {
-    if (!peerAvailable()) return;
+  function hostName() {
+    const p = app.state && app.state.players.find((x) => x.id === app.state.hostId);
+    return p ? p.name : app.name;
+  }
+  function pubInfo(gone) {
+    if (app.mode !== 'host' || !app.state) return;
+    const s = app.state;
+    rawPub(ROOMS + app.code, JSON.stringify({
+      t: 'room', code: app.code, host: hostName(), n: s.players.length,
+      state: s.phase === 'lobby' ? 'lobby' : 'game', ts: Date.now(), gone: !!gone, v: PROTO,
+    }), true);
+  }
+
+  async function hostStart(name, restore) {
+    if (!netAvailable()) return;
+    stopBrowse();
     teardown();
+    const token = app.session;
     app.mode = 'host';
     app.name = name;
-    app.hostRetry = 0;
+    app.epoch = newId().slice(0, 8);
+    app.ver = 0;
+    app.kicked = new Set();
     if (restore) {
       app.code = restore.code;
       app.state = restore.state;
@@ -111,102 +272,77 @@
       app.code = genCode();
       app.state = A.createRoom(app.code, app.cid, name);
     }
-    app.status = '방을 여는 중...';
-    openHostPeer();
+    app.status = '중계 서버에 연결하는 중...';
     hostPublish();
+    NET.onConnect = () => pubInfo(false);
+    try {
+      await netConnect(
+        { topic: ROOMS + app.code, payload: JSON.stringify({ t: 'room', code: app.code, ts: Date.now(), gone: true, v: PROTO }), qos: 0, retain: true },
+        [`${roomBase(app.code)}/h`],
+        (tp, txt) => { const m = parseMsg(txt); if (m && m.f) hostOnMsg(String(m.f), m); },
+      );
+    } catch (e) {
+      if (token === app.session) goHome('중계 서버에 하나도 연결할 수 없습니다. 인터넷(와이파이/데이터) 연결을 확인해주세요.');
+      return;
+    }
+    if (token !== app.session) return;
+    app.status = '';
+    pubInfo(false);
+    hostPublish();
+    keepAwake();
   }
 
-  function openHostPeer() {
-    const peer = new Peer(PEER_PREFIX + app.code, { debug: 1 });
-    app.peer = peer;
-    peer.on('open', () => {
-      if (app.peer !== peer) return;
-      app.status = '';
-      app.hostRetry = 0;
-      saveHost();
-      render();
-    });
-    peer.on('connection', (conn) => {
-      conn.on('data', (msg) => hostOnData(conn, msg));
-      conn.on('close', () => hostOnClose(conn));
-      conn.on('error', () => hostOnClose(conn));
-    });
-    peer.on('disconnected', () => {
-      if (app.peer !== peer || peer.destroyed) return;
-      app.status = '중계 서버와 재연결 중... (진행 중인 연결은 유지됩니다)';
-      render();
-      setTimeout(() => { if (app.peer === peer && !peer.destroyed && peer.disconnected) peer.reconnect(); }, 2000);
-    });
-    peer.on('error', (err) => {
-      if (app.peer !== peer) return;
-      if (err.type === 'unavailable-id') {
-        peer.destroy();
-        const fresh = app.state.phase === 'lobby' && app.state.players.length <= 1 && app.state.gameNo === 0;
-        if (fresh && app.hostRetry === 0) {
-          app.code = genCode();
-          app.state.code = app.code;
-          openHostPeer();
-          hostPublish();
-        } else {
-          app.hostRetry += 1;
-          if (app.hostRetry > 30) { goHome('방을 복구하지 못했습니다. 새 방을 만들어주세요.'); return; }
-          app.status = `이전 연결이 정리되기를 기다리는 중... (${app.hostRetry})`;
-          render();
-          setTimeout(() => { if (app.mode === 'host' && app.peer === peer) openHostPeer(); }, 3000);
-        }
-        return;
-      }
-      if (NET_ERRORS.includes(err.type)) { app.status = '네트워크 오류, 재연결 중...'; render(); return; }
-      if (err.type === 'browser-incompatible') { toast('이 브라우저는 WebRTC를 지원하지 않습니다. 최신 Chrome/Safari를 사용해주세요.'); return; }
-      console.warn('peer error', err);
-    });
+  function sendTo(cid, m) {
+    pub(`${roomBase(app.code)}/c/${cid}`, m);
   }
 
-  function hostOnData(conn, msg) {
-    if (!msg || typeof msg !== 'object' || app.mode !== 'host') return;
+  function sendState(pid) {
+    const c = app.clients.get(pid);
+    if (c) sendTo(c.cid, { t: 'state', ep: app.epoch, ver: app.ver, view: A.viewFor(app.state, pid) });
+  }
+
+  function hostOnMsg(cid, m) {
+    if (app.mode !== 'host' || !app.state) return;
     const s = app.state;
-    if (msg.type === 'join') {
-      const r = A.join(s, String(msg.cid || ''), msg.name);
-      if (r.error) {
-        safeSend(conn, { type: 'reject', reason: r.error });
-        setTimeout(() => { try { conn.close(); } catch (e) { /* ignore */ } }, 600);
-        return;
-      }
-      const old = app.conns.get(r.pid);
-      if (old && old !== conn) { old._pid = null; try { old.close(); } catch (e) { /* ignore */ } }
-      conn._pid = r.pid;
-      app.conns.set(r.pid, conn);
+    const now = Date.now();
+    if (m.t === 'hello') {
+      if (m.v !== PROTO) { sendTo(cid, { t: 'reject', reason: '호스트와 버전이 다릅니다. 두 기기 모두 새로고침한 뒤 다시 시도해주세요.' }); return; }
+      if (app.kicked.has(cid)) { sendTo(cid, { t: 'reject', reason: '호스트가 방에서 내보냈습니다.' }); return; }
+      if (cid === app.cid) return;
+      const before = JSON.stringify(s.players);
+      const r = A.join(s, cid, m.name);
+      if (r.error) { sendTo(cid, { t: 'reject', reason: r.error }); return; }
+      const old = app.clients.get(r.pid);
+      if (old && old.cid !== cid) sendTo(old.cid, { t: 'reject', reason: '다른 창에서 같은 플레이어로 접속했습니다.' });
+      app.clients.set(r.pid, { cid, seen: now });
+      if (JSON.stringify(s.players) !== before) hostPublish();
+      else if (m.ep !== app.epoch || m.ver !== app.ver) sendState(r.pid);
+      else sendTo(cid, { t: 'ok' });
+      return;
+    }
+    const pid = A.resolveId(s, cid);
+    const c = app.clients.get(pid);
+    if (!c || c.cid !== cid) return;
+    c.seen = now;
+    if (m.t === 'action') {
+      const err = runAction(pid, m.action, m.payload);
+      if (err) sendTo(cid, { t: 'error', msg: err });
+    } else if (m.t === 'bye') {
+      app.clients.delete(pid);
+      A.disconnect(s, pid);
       hostPublish();
-      return;
     }
-    if (msg.type === 'action') {
-      if (!conn._pid) return;
-      const err = runAction(conn._pid, msg.action, msg.payload);
-      if (err) safeSend(conn, { type: 'error', msg: err });
-      return;
-    }
-    if (msg.type === 'leave') hostOnClose(conn);
-  }
-
-  function hostOnClose(conn) {
-    const pid = conn._pid;
-    if (!pid || app.conns.get(pid) !== conn || app.mode !== 'host') return;
-    app.conns.delete(pid);
-    conn._pid = null;
-    A.disconnect(app.state, pid);
-    hostPublish();
   }
 
   function runAction(pid, action, payload) {
     const err = A.applyAction(app.state, pid, action, payload || {});
     if (err) return err;
     if (action === 'kick') {
-      const c = app.conns.get(payload.id);
+      const c = app.clients.get(payload.id);
       if (c) {
-        safeSend(c, { type: 'reject', reason: '호스트가 방에서 내보냈습니다.' });
-        app.conns.delete(payload.id);
-        c._pid = null;
-        setTimeout(() => { try { c.close(); } catch (e) { /* ignore */ } }, 400);
+        app.kicked.add(c.cid);
+        sendTo(c.cid, { t: 'reject', reason: '호스트가 방에서 내보냈습니다.' });
+        app.clients.delete(payload.id);
       }
     }
     hostPublish();
@@ -219,102 +355,137 @@
 
   function hostPublish() {
     if (app.mode !== 'host') return;
+    app.ver += 1;
     saveHost();
-    for (const [pid, conn] of app.conns) safeSend(conn, { type: 'state', view: A.viewFor(app.state, pid) });
+    for (const pid of app.clients.keys()) sendState(pid);
     app.view = A.viewFor(app.state, app.cid);
+    pubInfo(false);
     render();
   }
 
   /* ---------------- 참가자 ---------------- */
-  function clientStart(code, name) {
-    if (!peerAvailable()) return;
+  async function clientStart(code, name) {
+    if (!netAvailable()) return;
+    stopBrowse();
     teardown();
+    const token = app.session;
     app.mode = 'client';
     app.code = code;
     app.name = name;
-    app.everConnected = false;
-    app.status = '방에 연결하는 중...';
+    app.viewEpoch = '';
+    app.viewVer = -1;
+    app.hostSeen = 0;
+    app.t0 = Date.now();
+    app.status = '중계 서버에 연결하는 중...';
     render();
-    const peer = new Peer({ debug: 1 });
-    app.peer = peer;
-    peer.on('open', () => { if (app.peer === peer && !app.conn) clientConnect(); });
-    peer.on('disconnected', () => {
-      if (app.peer !== peer || peer.destroyed) return;
-      setTimeout(() => { if (app.peer === peer && !peer.destroyed && peer.disconnected) peer.reconnect(); }, 2000);
-    });
-    peer.on('error', (err) => {
-      if (app.peer !== peer) return;
-      if (err.type === 'peer-unavailable') {
-        if (!app.everConnected) goHome('방을 찾을 수 없습니다. 방 코드를 확인하거나 호스트가 방을 열었는지 확인해주세요.');
-        else { app.status = '호스트를 기다리는 중... (호스트가 재접속하면 자동으로 연결됩니다)'; render(); scheduleReconnect(); }
-        return;
-      }
-      if (NET_ERRORS.includes(err.type)) { app.status = '네트워크 오류, 재연결 중...'; render(); scheduleReconnect(); return; }
-      console.warn('peer error', err);
-    });
+    NET.onConnect = () => sendHello();
+    try {
+      await netConnect(null, [`${roomBase(code)}/c/${app.cid}`, ROOMS + code], clientOnMsg);
+    } catch (e) {
+      if (token === app.session) goHome('중계 서버에 하나도 연결할 수 없습니다. 인터넷(와이파이/데이터) 연결을 확인해주세요.');
+      return;
+    }
+    if (token !== app.session) return;
+    app.t0 = Date.now();
+    app.status = '방을 찾는 중...';
+    render();
+    sendHello();
   }
 
-  function scheduleReconnect() {
-    if (app.mode !== 'client' || app.reconnectTimer) return;
-    app.reconnectTimer = setTimeout(() => {
-      app.reconnectTimer = null;
-      clientConnect();
-    }, 3000);
+  function sendHello() {
+    if (app.mode !== 'client') return;
+    app.lastHello = Date.now();
+    pub(`${roomBase(app.code)}/h`, { t: 'hello', f: app.cid, name: app.name, v: PROTO, ep: app.viewEpoch, ver: app.viewVer });
   }
 
-  function clientConnect() {
-    const peer = app.peer;
-    if (app.mode !== 'client' || !peer || peer.destroyed) return;
-    if (app.conn && app.conn.open) return;
-    if (peer.disconnected) { peer.reconnect(); return; } // 'open' 이벤트에서 다시 시도
-    const conn = peer.connect(PEER_PREFIX + app.code, { reliable: true });
-    const timer = setTimeout(() => {
-      if (app.conn !== conn) { try { conn.close(); } catch (e) { /* ignore */ } scheduleReconnect(); }
-    }, 12000);
-    conn.on('open', () => {
-      clearTimeout(timer);
-      if (app.peer !== peer) { conn.close(); return; }
-      app.conn = conn;
-      app.everConnected = true;
+  function clientOnMsg(tp, txt) {
+    if (app.mode !== 'client') return;
+    if (tp.startsWith(ROOMS)) {
+      if (!txt) { app.info = { gone: true, ts: Date.now() }; return; }
+      try { const m = JSON.parse(txt); if (m && m.t === 'room') app.info = m; } catch (e) { /* ignore */ }
+      return;
+    }
+    const m = parseMsg(txt);
+    if (!m) return;
+    app.hostSeen = Date.now();
+    if (m.t === 'state') {
+      if (m.ep === app.viewEpoch && m.ver <= app.viewVer) return; // 늦게 도착한 이전 상태
+      app.viewEpoch = m.ep;
+      app.viewVer = m.ver;
+      app.view = m.view;
+      if (!app.joined) { app.joined = true; keepAwake(); }
       app.status = '';
-      conn.send({ type: 'join', cid: app.cid, name: app.name });
-      render();
-    });
-    conn.on('data', (msg) => { if (app.conn === conn) clientOnData(msg); });
-    const lost = () => {
-      clearTimeout(timer);
-      if (app.conn === conn) {
-        app.conn = null;
-        app.status = '연결이 끊겼습니다. 재연결 중...';
-        render();
-        scheduleReconnect();
-      }
-    };
-    conn.on('close', lost);
-    conn.on('error', lost);
-  }
-
-  function clientOnData(msg) {
-    if (!msg || typeof msg !== 'object') return;
-    if (msg.type === 'state') {
-      app.view = msg.view;
       store.set('avalon-client', { code: app.code, name: app.name, savedAt: Date.now() });
       render();
-    } else if (msg.type === 'error') {
-      toast(msg.msg);
-    } else if (msg.type === 'reject') {
+    } else if (m.t === 'error') {
+      toast(m.msg);
+    } else if (m.t === 'reject') {
       store.del('avalon-client');
-      goHome(msg.reason);
+      goHome(m.reason);
+    } else if (m.t === 'ok' && app.status) {
+      app.status = '';
+      render();
     }
   }
+
+  /* ---------------- 연결 유지 타이머 ---------------- */
+  let lastBeat = Date.now();
+  function resumed() {
+    const now = Date.now();
+    for (const c of app.clients.values()) c.seen = now;
+    app.hostSeen = now;
+    lastBeat = now;
+    for (const c of NET.clis) if (!c.connected) { try { c.reconnect(); } catch (e) { /* ignore */ } }
+    if (app.mode === 'client') sendHello();
+    if (app.mode === 'host') pubInfo(false);
+    keepAwake();
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) resumed(); });
+
+  setInterval(() => {
+    const now = Date.now();
+    const gap = now - lastBeat;
+    lastBeat = now;
+    if (gap > 5000) { resumed(); return; } // 화면이 꺼졌다 켜진 경우
+    if (app.mode === 'host' && app.state) {
+      let changed = false;
+      for (const [pid, c] of app.clients) {
+        if (now - c.seen > 15000) {
+          app.clients.delete(pid);
+          A.disconnect(app.state, pid);
+          changed = true;
+        }
+      }
+      if (changed) hostPublish();
+      const st = netUp() ? '' : '중계 서버와 연결이 끊겼습니다. 다시 연결하는 중...';
+      if (st !== app.status && (app.status === '' || app.status.startsWith('중계 서버와'))) { app.status = st; render(); }
+    } else if (app.mode === 'client' && NET.clis.length) {
+      const el = (now - app.t0) / 1000;
+      if (!app.joined) {
+        if (el > 10 && !app.info) { goHome('방을 찾을 수 없습니다. 방 코드를 확인하거나, 호스트에게 방이 열려 있는지 확인해주세요.'); return; }
+        if (el > 90) { goHome('호스트가 응답하지 않습니다. 호스트 화면이 켜져 있는지 확인 후 다시 시도해주세요.'); return; }
+        if (app.info && app.info.v && app.info.v !== PROTO) { goHome('호스트와 버전이 다릅니다. 두 기기 모두 새로고침한 뒤 다시 시도해주세요.'); return; }
+        const away = app.info && (app.info.gone || now - app.info.ts > 20000);
+        app.status = !app.info ? `방을 찾는 중... (${Math.floor(el)}초)` : (away ? '호스트 화면이 꺼져 있는 것 같아요. 호스트가 돌아오면 자동으로 입장합니다...' : '호스트의 응답을 기다리는 중...');
+        render();
+        if (now - app.lastHello > 1500) sendHello();
+      } else {
+        const lost = now - app.hostSeen > 9000;
+        const st = lost ? '호스트와 연결이 끊겼어요. 다시 연결되면 자동으로 이어집니다...' : '';
+        if (st !== app.status) { app.status = st; render(); }
+        if (now - app.lastHello > 3000) sendHello();
+      }
+    }
+  }, 1000);
+  setInterval(() => { if (app.mode === 'host' && NET.clis.length) pubInfo(false); }, 5000);
 
   /* ---------------- 행동 ---------------- */
   function act(action, payload) {
     if (app.mode === 'host') {
       const err = runAction(app.cid, action, payload);
       if (err) toast(err);
-    } else if (app.conn && app.conn.open) {
-      app.conn.send({ type: 'action', action, payload });
+    } else if (app.joined && netUp()) {
+      pub(`${roomBase(app.code)}/h`, { t: 'action', f: app.cid, action, payload });
     } else {
       toast('연결 중입니다. 잠시 후 다시 시도해주세요.');
     }
@@ -323,16 +494,23 @@
   function leave() {
     if (app.mode === 'host') {
       if (!confirm('방을 닫으면 모든 참가자의 연결이 끊어집니다. 정말 나가시겠습니까?')) return;
-      for (const [, c] of app.conns) safeSend(c, { type: 'reject', reason: '호스트가 방을 닫았습니다.' });
+      for (const c of app.clients.values()) sendTo(c.cid, { t: 'reject', reason: '호스트가 방을 닫았습니다.' });
+      rawPub(ROOMS + app.code, '', true);
       store.del('avalon-host');
-      setTimeout(() => goHome(), 300);
+      const s = app.session;
+      setTimeout(() => { if (s === app.session) goHome(); }, 500);
       return;
     }
     if (app.view && app.view.phase !== 'lobby' && app.view.phase !== 'end' && !confirm('게임 중입니다. 나가시겠습니까? (같은 닉네임으로 다시 들어올 수 있습니다)')) return;
-    if (app.conn) safeSend(app.conn, { type: 'leave' });
+    if (app.joined) pub(`${roomBase(app.code)}/h`, { t: 'bye', f: app.cid });
     store.del('avalon-client');
-    setTimeout(() => goHome(), 200);
+    const s = app.session;
+    setTimeout(() => { if (s === app.session) goHome(); }, 300);
   }
+
+  window.addEventListener('beforeunload', () => {
+    if (app.mode === 'host') pubInfo(true);
+  });
 
   async function copyInvite() {
     const link = inviteLink(app.code);
@@ -389,6 +567,10 @@
         <button class="${roomParam ? 'primary' : ''}" data-act="join">🚪 입장하기</button>
         ${roomParam ? '<button class="link" data-act="clearRoom">새 방을 만들고 싶어요</button>' : ''}
         ${resume ? `<div class="resume">${resume}</div>` : ''}
+      </section>
+      <section class="card">
+        <div class="row-between"><h2>열려 있는 방</h2><span class="muted" id="roomCnt"></span></div>
+        <div id="roomList"><div class="empty">방 목록 서버에 연결하는 중...</div></div>
       </section>
       <section class="card">
         <h2>인원별 구성</h2>
@@ -663,7 +845,7 @@
     const showStatus = app.mode !== 'home' && app.status && app.view;
     st.hidden = !showStatus;
     st.textContent = showStatus ? app.status : '';
-    if (app.mode === 'home') root.innerHTML = renderHome();
+    if (app.mode === 'home') { root.innerHTML = renderHome(); startBrowse(); renderRooms(); }
     else if (!app.view) root.innerHTML = renderConnecting();
     else if (app.view.phase === 'lobby') root.innerHTML = renderLobby(app.view);
     else root.innerHTML = renderGame(app.view);
@@ -694,6 +876,7 @@
         clientStart(code, name);
         break;
       }
+      case 'joinRoom': { const name = readName(); if (name) clientStart(el.dataset.code, name); break; }
       case 'resumeHost': { const h = store.get('avalon-host'); if (h) hostStart(h.name, h); break; }
       case 'resumeClient': { const c = store.get('avalon-client'); if (c) clientStart(c.code, c.name); break; }
       case 'clearRoom': history.replaceState(null, '', location.pathname); render(); break;

@@ -13,8 +13,18 @@
   <div id="status" hidden></div>
   <main id="app"></main>
   <div id="toast" hidden></div>
+  <div id="chat" hidden>
+    <button id="chatFab" data-act="chatToggle" aria-label="채팅 열기">💬<span id="chatBadge" hidden></span></button>
+    <div id="chatPanel" hidden>
+      <div class="chat-head"><b>💬 채팅</b><small class="muted">대화 기록은 방이 열려 있는 동안 남습니다</small><button class="mini ghost" data-act="chatToggle">닫기</button></div>
+      <div id="chatList"></div>
+      <div class="chat-input"><input id="chatInput" maxlength="200" placeholder="메시지를 입력하세요" autocomplete="off" enterkeyhint="send"><button class="mini primary" data-act="chatSend">전송</button></div>
+    </div>
+  </div>
+  <div id="fx" data-act="fxSkip" hidden></div>
   <script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
   <script src="game.js"></script>
+  <script src="roleart.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

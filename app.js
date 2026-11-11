@@ -52,6 +52,14 @@
     hostSeen: 0,
     t0: 0,
     lastHello: 0,
+    chatSent: 0,
+    // chat & effects
+    chat: [],
+    chatOpen: false,
+    unread: 0,
+    deadlineAt: null,
+    fxQueue: [],
+    fxBusy: false,
   };
 
   /* ---------------- 네트워크: 공개 MQTT 중계 서버 ----------------
@@ -217,6 +225,12 @@
     app.clients = new Map();
     app.joined = false;
     app.info = null;
+    app.chat = [];
+    app.unread = 0;
+    app.chatOpen = false;
+    app.deadlineAt = null;
+    app.fxQueue = [];
+    renderChat();
   }
 
   function goHome(msg) {
@@ -261,6 +275,7 @@
     app.epoch = newId().slice(0, 8);
     app.ver = 0;
     app.kicked = new Set();
+    app.chatSent = 0;
     if (restore) {
       app.code = restore.code;
       app.state = restore.state;
@@ -268,10 +283,13 @@
       store.set('avalon-cid', app.cid, sessionStorage);
       if (app.state.phase === 'lobby') app.state.players = app.state.players.filter((p) => p.id === app.state.hostId);
       app.state.players.forEach((p) => { p.connected = p.id === app.state.hostId; });
+      app.state.chat = app.state.chat || [];
+      if (app.state.phase === 'propose') app.state.deadline = Math.max(app.state.deadline || 0, Date.now() + 60000);
     } else {
       app.code = genCode();
       app.state = A.createRoom(app.code, app.cid, name);
     }
+    app.chatSent = app.state.chat.length;
     app.status = '중계 서버에 연결하는 중...';
     hostPublish();
     NET.onConnect = () => pubInfo(false);
@@ -315,6 +333,8 @@
       const old = app.clients.get(r.pid);
       if (old && old.cid !== cid) sendTo(old.cid, { t: 'reject', reason: '다른 창에서 같은 플레이어로 접속했습니다.' });
       app.clients.set(r.pid, { cid, seen: now });
+      const chatN = Number.isInteger(m.chatN) ? m.chatN : 0;
+      if (chatN < s.chat.length) sendTo(cid, { t: 'chat', from: chatN, msgs: s.chat.slice(chatN, chatN + 80) });
       if (JSON.stringify(s.players) !== before) hostPublish();
       else if (m.ep !== app.epoch || m.ver !== app.ver) sendState(r.pid);
       else sendTo(cid, { t: 'ok' });
@@ -337,6 +357,7 @@
   function runAction(pid, action, payload) {
     const err = A.applyAction(app.state, pid, action, payload || {});
     if (err) return err;
+    if (action === 'chat') { saveHost(); flushChat(); return null; }
     if (action === 'kick') {
       const c = app.clients.get(payload.id);
       if (c) {
@@ -353,12 +374,25 @@
     if (app.mode === 'host' && app.state) store.set('avalon-host', { code: app.code, name: app.name, state: app.state, savedAt: Date.now() });
   }
 
+  function flushChat() {
+    if (app.mode !== 'host' || !app.state) return;
+    const chat = app.state.chat;
+    if (chat.length > app.chatSent) {
+      const msg = { t: 'chat', from: app.chatSent, msgs: chat.slice(app.chatSent) };
+      for (const c of app.clients.values()) sendTo(c.cid, msg);
+      const added = chat.length - app.chatSent;
+      app.chatSent = chat.length;
+      onChatAdded(chat.slice(-added));
+    }
+  }
+
   function hostPublish() {
     if (app.mode !== 'host') return;
     app.ver += 1;
     saveHost();
     for (const pid of app.clients.keys()) sendState(pid);
-    app.view = A.viewFor(app.state, app.cid);
+    setView(A.viewFor(app.state, app.cid));
+    flushChat();
     pubInfo(false);
     render();
   }
@@ -395,7 +429,7 @@
   function sendHello() {
     if (app.mode !== 'client') return;
     app.lastHello = Date.now();
-    pub(`${roomBase(app.code)}/h`, { t: 'hello', f: app.cid, name: app.name, v: PROTO, ep: app.viewEpoch, ver: app.viewVer });
+    pub(`${roomBase(app.code)}/h`, { t: 'hello', f: app.cid, name: app.name, v: PROTO, ep: app.viewEpoch, ver: app.viewVer, chatN: app.chat.length });
   }
 
   function clientOnMsg(tp, txt) {
@@ -412,11 +446,18 @@
       if (m.ep === app.viewEpoch && m.ver <= app.viewVer) return; // 늦게 도착한 이전 상태
       app.viewEpoch = m.ep;
       app.viewVer = m.ver;
-      app.view = m.view;
+      setView(m.view);
       if (!app.joined) { app.joined = true; keepAwake(); }
       app.status = '';
       store.set('avalon-client', { code: app.code, name: app.name, savedAt: Date.now() });
       render();
+    } else if (m.t === 'chat') {
+      if (!Array.isArray(m.msgs) || !Number.isInteger(m.from)) return;
+      if (m.from > app.chat.length) return; // 빠진 메시지는 다음 hello 때 다시 받음
+      const fresh = m.msgs.slice(app.chat.length - m.from);
+      if (!fresh.length) return;
+      app.chat.push(...fresh);
+      onChatAdded(fresh);
     } else if (m.t === 'error') {
       toast(m.msg);
     } else if (m.t === 'reject') {
@@ -456,6 +497,7 @@
           changed = true;
         }
       }
+      if (A.tick(app.state, now)) changed = true;
       if (changed) hostPublish();
       const st = netUp() ? '' : '중계 서버와 연결이 끊겼습니다. 다시 연결하는 중...';
       if (st !== app.status && (app.status === '' || app.status.startsWith('중계 서버와'))) { app.status = st; render(); }
@@ -683,21 +725,34 @@
     }).join('');
     const rejects = [0, 1, 2, 3, 4].map((i) => `<span class="rdot ${i < v.rejectCount ? 'on' : ''} ${i === 4 ? 'last' : ''}"></span>`).join('');
 
-    // 역할 카드
+    // 역할 카드 (확인하면 같은 편/알고 있는 정보 표시)
+    const knowMap = {};
+    if (v.myRole && !app.roleHidden) {
+      v.knowledge.forEach((k) => { knowMap[k.id] = (knowMap[k.id] || []).concat(knowTag(v.myRole, k.label)); });
+      (v.ladyChecks || []).forEach((c) => { knowMap[c.target] = (knowMap[c.target] || []).concat(`<span class="tag know ${c.team}">🌊 ${c.team === 'good' ? '선' : '악'}</span>`); });
+    }
     let roleCard = '';
     if (v.myRole) {
       const R = A.ROLES[v.myRole];
-      const know = v.knowledge.length
-        ? `<ul class="know">${v.knowledge.map((k) => `<li><b>${esc(nameOf(k.id))}</b> — ${esc(k.label)}</li>`).join('')}</ul>`
-        : (v.myRole === 'merlin' ? '<p class="muted">보이는 악이 없습니다.</p>' : '');
+      let know = '';
+      if (v.knowledge.length) {
+        const title = R.team === 'evil' ? '🗡 같은 편 (악의 세력)' : (v.myRole === 'merlin' ? '👁 당신이 알고 있는 악의 세력' : '✨ 멀린 후보');
+        know = `<div class="know"><b>${title}</b><ul>${v.knowledge.map((k) => `<li><b>${esc(nameOf(k.id))}</b> — ${esc(k.label)}</li>`).join('')}</ul></div>`;
+      } else if (v.myRole === 'merlin') know = '<p class="muted">보이는 악이 없습니다.</p>';
+      else if (v.myRole === 'oberon') know = '<p class="muted">오베론은 같은 편을 알 수 없고, 같은 편도 당신을 모릅니다.</p>';
+      else if (R.team === 'good') know = '<p class="muted">선의 세력은 서로를 알 수 없습니다. 추리로 같은 편을 찾으세요.</p>';
       const lady = v.ladyChecks && v.ladyChecks.length
         ? `<div class="ladyinfo">🌊 호수의 여인 결과:<ul>${v.ladyChecks.map((c) => `<li><b>${esc(nameOf(c.target))}</b> — <span class="${c.team}-t">${c.team === 'good' ? '선' : '악'}</span></li>`).join('')}</ul></div>` : '';
-      roleCard = `<section class="card rolecard ${app.roleHidden ? 'hidden-role' : R.team}" data-act="toggleRole">
+      roleCard = `<section class="card rolecard ${app.roleHidden ? 'hidden-role' : R.team}">
         ${app.roleHidden
-          ? '<div class="reveal">🔒 내 역할 확인하기 <small>(탭해서 보기 · 다른 사람이 보지 않게 주의)</small></div>'
-          : `<div class="role-top"><span class="role-team">${R.team === 'good' ? '🛡️ 선의 세력' : '🗡️ 악의 세력'}</span><small>탭해서 숨기기</small></div>
-             <div class="role-name">${R.name}</div>
-             <p>${R.desc}</p>${know}${lady}`}
+          ? '<button class="reveal" data-act="toggleRole">🔒 내 역할 확인하기 <small>탭해서 보기 · 다른 사람이 보지 않게 주의하세요</small></button>'
+          : `<div class="role-top"><span class="role-team">${R.team === 'good' ? '🛡️ 선의 세력' : '🗡️ 악의 세력'}</span><button class="mini ghost" data-act="toggleRole">🔒 역할 잠그기</button></div>
+             <div class="role-body">
+               <div class="role-art">${window.RoleArt ? window.RoleArt(v.myRole, R.name) : ''}</div>
+               <div class="role-text"><div class="role-name">${R.name}</div><p>${R.desc}</p></div>
+             </div>
+             ${know}${lady}
+             <p class="hint">플레이어 목록에 같은 편/알고 있는 정보가 표시됩니다. 잠그면 사라집니다.</p>`}
       </section>`;
     }
 
@@ -707,11 +762,12 @@
       const pickable = canPick(v, p.id);
       const selected = app.selection.includes(p.id);
       const tags = [];
+      if (knowMap[p.id]) tags.push(...knowMap[p.id]);
       if (p.id === v.leaderId && v.phase !== 'end') tags.push('<span class="tag lead">👑 대표</span>');
       if (v.lady && v.lady.holder === p.id && v.phase !== 'end') tags.push('<span class="tag lady">🌊</span>');
       if (v.team.includes(p.id)) tags.push('<span class="tag team">🛡 원정대</span>');
-      if (v.phase === 'vote' && v.votedIds.includes(p.id)) tags.push('<span class="tag done">투표 완료</span>');
-      if (v.phase === 'quest' && v.questDone.includes(p.id)) tags.push('<span class="tag done">카드 제출</span>');
+      if (v.phase === 'vote') tags.push(v.votedIds.includes(p.id) ? '<span class="tag done">투표 완료</span>' : '<span class="tag think">고민 중…</span>');
+      if (v.phase === 'quest' && v.team.includes(p.id)) tags.push(v.questDone.includes(p.id) ? '<span class="tag done">카드 제출</span>' : '<span class="tag think">고르는 중…</span>');
       if (showLastVote && p.id in v.lastVote.votes && v.phase !== 'vote') tags.push(v.lastVote.votes[p.id] ? '<span class="tag yes">찬성</span>' : '<span class="tag no">반대</span>');
       if (!p.connected) tags.push('<span class="tag off">연결 끊김</span>');
       let roleTag = '';
@@ -725,6 +781,7 @@
       </li>`;
     }).join('');
 
+    const w = waitingInfo(v, nameOf);
     return `
       <div class="topbar">
         <span>방 <b>${esc(v.code)}</b> · ${v.n}명</span>
@@ -732,11 +789,12 @@
         <button class="mini ghost" data-act="${v.isHost ? 'menu' : 'leave'}">${v.isHost ? '⋯' : '나가기'}</button>
       </div>
       ${v.phase === 'end' ? renderEnd(v) : ''}
+      ${v.phase !== 'end' ? `<div class="nowbar ${w.mine ? 'mine' : ''}">${w.mine ? '🔔 ' : ''}${w.short}${w.mine ? '' : '<span class="dots"><i></i><i></i><i></i></span>'}${v.phase === 'propose' ? ' <span class="timer" data-timer></span>' : ''}</div>` : ''}
       <section class="card board">
         <div class="quests">${quests}</div>
         <div class="rejects"><span>부결</span>${rejects}<span class="muted">${v.rejectCount}/5</span></div>
       </section>
-      ${v.phase !== 'end' ? renderAction(v, nameOf) : ''}
+      ${v.phase !== 'end' ? renderAction(v, nameOf, w) : ''}
       ${roleCard}
       <section class="card">
         <h2>플레이어 <small class="muted">(앉은 순서 · 대표는 순서대로 넘어갑니다)</small></h2>
@@ -746,41 +804,92 @@
       ${renderLog(v, nameOf)}`;
   }
 
-  function renderAction(v, nameOf) {
-    const leaderName = nameOf(v.leaderId);
-    const size = v.sizes[v.questIdx];
-    const teamNames = v.team.map((id) => `<b>${esc(nameOf(id))}</b>`).join(', ');
-    let body = '';
+  function knowTag(myRole, label) {
+    if (A.ROLES[myRole].team === 'evil') return '<span class="tag know evil">🗡 같은 편</span>';
+    if (myRole === 'merlin') return '<span class="tag know evil">👁 악</span>';
+    return `<span class="tag know good">✨ ${esc(label)}</span>`;
+  }
+
+  // 지금 누가 무엇을 하는 중인지 (모두에게 보이는 안내)
+  function waitingInfo(v, nameOf) {
+    const leader = esc(nameOf(v.leaderId));
+    const names = (ids) => ids.map((id) => esc(nameOf(id))).join(', ');
     switch (v.phase) {
       case 'propose':
+        return v.leaderId === v.me
+          ? { mine: true, short: '당신이 원정대를 꾸릴 차례입니다' }
+          : { mine: false, short: `👑 ${leader}님이 원정대를 꾸리는 중` };
+      case 'vote': {
+        const left = v.players.filter((p) => !v.votedIds.includes(p.id)).map((p) => p.id);
+        if (v.myVote === null) return { mine: true, short: '원정대 찬반 투표를 해주세요', left };
+        return { mine: false, short: `찬반 투표 중 · ${left.length}명 남음`, detail: `아직 투표하지 않은 사람: ${names(left)}`, left };
+      }
+      case 'quest': {
+        const left = v.team.filter((id) => !v.questDone.includes(id));
+        if (v.team.includes(v.me) && !v.questDone.includes(v.me)) return { mine: true, short: '성공/실패 카드를 골라주세요', left };
+        return { mine: false, short: `원정대가 성공/실패를 고르는 중 · ${v.questDone.length}/${v.team.length}`, detail: `아직 고르는 중: ${names(left)}`, left };
+      }
+      case 'lady':
+        return v.lady.holder === v.me
+          ? { mine: true, short: '호수의 여인으로 확인할 사람을 고르세요' }
+          : { mine: false, short: `🌊 ${esc(nameOf(v.lady.holder))}님이 진영을 확인할 사람을 고르는 중` };
+      case 'assassin': {
+        if (v.myRole === 'assassin') return { mine: true, short: '최종 지목: 멀린을 골라 암살하세요' };
+        const evilMate = v.knowledge && v.myRole && A.ROLES[v.myRole].team === 'evil';
+        const who = evilMate ? v.knowledge.map((k) => k.id) : [];
+        return { mine: false, short: '🗡 암살자가 멀린을 최종 지목하는 중', detail: evilMate && who.length ? '같은 편과 상의해서 멀린을 찾아주세요.' : '멀린은 끝까지 정체를 숨기세요!' };
+      }
+      default:
+        return { mine: false, short: '' };
+    }
+  }
+
+  function renderAction(v, nameOf, w) {
+    const size = v.sizes[v.questIdx];
+    const teamNames = v.team.map((id) => `<b>${esc(nameOf(id))}</b>`).join(', ');
+    const waitBox = (title, lines) => `<div class="waitbox"><div class="dots big"><i></i><i></i><i></i></div><h3>${title}</h3>${lines || ''}</div>`;
+    let body = '';
+    switch (v.phase) {
+      case 'propose': {
+        const two = A.failsNeeded(v.n, v.questIdx) === 2;
+        const timerBox = `<div class="timerbox"><span>⏳ 남은 시간</span><span class="timer big" data-timer></span>${v.extendUsed ? '<small class="muted">Last 5분 사용됨</small>' : ''}</div>`;
         if (v.leaderId === v.me) {
-          const two = A.failsNeeded(v.n, v.questIdx) === 2;
           body = `<h3>👑 당신이 대표입니다</h3>
+            ${timerBox}
             <p>퀘스트 ${v.questIdx + 1}에 보낼 원정대 <b>${size}명</b>을 아래 플레이어 목록에서 고르세요. (${app.selection.length}/${size})${two ? '<br><small>이번 퀘스트는 실패 카드 2장이 있어야 실패합니다.</small>' : ''}</p>
+            <p class="hint">시간이 지나면 원정대가 무작위로 선택됩니다.</p>
             ${v.rejectCount === 4 ? '<p class="warn">⚠️ 이번 제안이 부결되면 악이 승리합니다!</p>' : ''}
-            <button class="primary" data-act="propose" ${app.selection.length === size ? '' : 'disabled'}>원정대 제안하기</button>`;
+            <button class="primary" data-act="propose" ${app.selection.length === size ? '' : 'disabled'}>원정대 제안하기</button>
+            <button class="extend" data-act="extend" ${v.extendUsed ? 'disabled' : ''}>${v.extendUsed ? '⏱ Last 5분 사용 완료' : '⏱ Last 5분 사용 (+5분, 이번 턴 1회)'}</button>`;
         } else {
-          body = `<h3>👑 ${esc(leaderName)} 님이 원정대를 고르는 중</h3><p>퀘스트 ${v.questIdx + 1} · 원정대 ${size}명 · ${v.rejectCount + 1}번째 제안</p>`;
+          body = waitBox(`👑 ${esc(nameOf(v.leaderId))}님이 원정대를 꾸리는 중`, `${timerBox}<p>퀘스트 ${v.questIdx + 1} · 원정대 ${size}명 · ${v.rejectCount + 1}번째 제안</p>`);
         }
         break;
+      }
       case 'vote':
-        body = `<h3>찬반 투표 (${v.votedIds.length}/${v.n})</h3>
-          <p>${esc(leaderName)} 님의 제안: ${teamNames}</p>
-          ${v.rejectCount === 4 ? '<p class="warn">⚠️ 이번 투표가 부결되면 악이 승리합니다!</p>' : ''}
-          ${v.myVote === null
-            ? '<div class="btns"><button class="yes" data-act="vote" data-v="1">👍 찬성</button><button class="no" data-act="vote" data-v="0">👎 반대</button></div>'
-            : `<p class="muted">내 투표: <b>${v.myVote ? '찬성' : '반대'}</b> · 다른 사람을 기다리는 중...</p>`}`;
+        if (v.myVote === null) {
+          body = `<h3>🗳 찬반 투표 (${v.votedIds.length}/${v.n})</h3>
+            <p>${esc(nameOf(v.leaderId))}님의 제안: ${teamNames}</p>
+            ${v.rejectCount === 4 ? '<p class="warn">⚠️ 이번 투표가 부결되면 악이 승리합니다!</p>' : ''}
+            <div class="btns"><button class="yes" data-act="vote" data-v="1">👍 찬성</button><button class="no" data-act="vote" data-v="0">👎 반대</button></div>`;
+        } else {
+          body = waitBox(`다른 플레이어들이 찬반 투표 중 (${v.votedIds.length}/${v.n})`,
+            `<p>${esc(nameOf(v.leaderId))}님의 제안: ${teamNames}</p><p class="muted">내 투표: <b>${v.myVote ? '찬성' : '반대'}</b></p><p class="hint">${w.detail}</p>`);
+        }
         break;
       case 'quest': {
         const onTeam = v.team.includes(v.me);
         const done = v.questDone.includes(v.me);
         const good = v.myRole && A.ROLES[v.myRole].team === 'good';
-        body = `<h3>퀘스트 ${v.questIdx + 1} 진행 중 (${v.questDone.length}/${v.team.length})</h3>
-          <p>원정대: ${teamNames}</p>
-          ${onTeam && !done
-            ? `<p>몰래 카드를 내세요.</p><div class="btns"><button class="yes" data-act="quest" data-v="1">✓ 성공</button><button class="no" data-act="quest" data-v="0" ${good ? 'disabled title="선은 성공만 낼 수 있습니다"' : ''}>✗ 실패</button></div>
-               ${good ? '<p class="hint">선의 세력은 성공 카드만 낼 수 있습니다.</p>' : ''}`
-            : `<p class="muted">${onTeam ? '카드를 냈습니다. ' : ''}원정대의 결과를 기다리는 중...</p>`}`;
+        if (onTeam && !done) {
+          body = `<h3>⚔️ 퀘스트 ${v.questIdx + 1} — 카드를 고르세요</h3>
+            <p>원정대: ${teamNames}</p>
+            <div class="btns"><button class="yes" data-act="quest" data-v="1">✓ 성공</button><button class="no" data-act="quest" data-v="0" ${good ? 'disabled title="선은 성공만 낼 수 있습니다"' : ''}>✗ 실패</button></div>
+            ${good ? '<p class="hint">선의 세력은 성공 카드만 낼 수 있습니다.</p>' : '<p class="hint">카드는 섞여서 공개되므로 누가 냈는지 알 수 없습니다.</p>'}`;
+        } else {
+          body = waitBox(`원정대가 성공/실패 카드를 고르는 중 (${v.questDone.length}/${v.team.length})`,
+            `<p>원정대: ${teamNames}</p>${onTeam ? '<p class="muted">카드를 냈습니다.</p>' : ''}<p class="hint">${w.detail}</p>`);
+        }
         break;
       }
       case 'lady':
@@ -788,15 +897,15 @@
           body = `<h3>🌊 호수의 여인</h3><p>진영을 확인할 사람을 한 명 고르세요. (이전에 호수의 여인을 가졌던 사람은 제외) 확인한 사람에게 호수의 여인이 넘어갑니다.</p>
             <button class="primary" data-act="lady" ${app.selection.length === 1 ? '' : 'disabled'}>확인하기</button>`;
         } else {
-          body = `<h3>🌊 호수의 여인</h3><p>${esc(nameOf(v.lady.holder))} 님이 한 사람의 진영을 확인하는 중...</p>`;
+          body = waitBox(`🌊 ${esc(nameOf(v.lady.holder))}님이 진영을 확인할 사람을 고르는 중`, '');
         }
         break;
       case 'assassin':
         if (v.myRole === 'assassin') {
-          body = `<h3>🗡️ 선이 퀘스트 3개를 성공했습니다</h3><p>멀린이라고 생각하는 사람을 지목하세요. 맞히면 악의 역전승입니다. (악의 동료와 상의해도 됩니다)</p>
+          body = `<h3>🗡️ 최종 지목 — 멀린을 고르세요</h3><p>선이 퀘스트 3개를 성공했습니다. 멀린이라고 생각하는 사람을 지목하세요. 맞히면 악의 역전승입니다. (같은 편과 상의해도 됩니다)</p>
             <button class="no" data-act="assassinate" ${app.selection.length === 1 ? '' : 'disabled'}>암살하기</button>`;
         } else {
-          body = '<h3>🗡️ 선이 퀘스트 3개를 성공했습니다</h3><p>암살자가 멀린을 찾는 중입니다... 멀린을 숨겨주세요!</p>';
+          body = waitBox('🗡️ 암살자가 멀린을 최종 지목하는 중', `<p>선이 퀘스트 3개를 성공했습니다.</p><p class="hint">${w.detail}</p>`);
         }
         break;
       default:
@@ -810,7 +919,7 @@
         <span class="good-t">찬성 ${yes.length}</span>: ${yes.join(', ') || '-'}<br>
         <span class="evil-t">반대 ${no.length}</span>: ${no.join(', ') || '-'}</div>`;
     }
-    return `<section class="card action">${body}${last}</section>`;
+    return `<section class="card action ${w.mine ? 'mine' : ''}">${body}${last}</section>`;
   }
 
   function renderEnd(v) {
@@ -834,6 +943,7 @@
         return `<li class="qlog"><span class="lq">Q${e.q}</span> 퀘스트 <b class="${e.success ? 'good-t' : 'evil-t'}">${e.success ? '성공' : '실패'}</b> — 실패 카드 ${e.fails}장${e.need === 2 ? ' (2장 필요)' : ''}</li>`;
       }
       if (e.t === 'lady') return `<li><span class="lq">🌊</span> ${esc(nameOf(e.holder))} → ${esc(nameOf(e.target))} 진영 확인</li>`;
+      if (e.t === 'auto') return `<li><span class="lq">⏰</span> ${esc(nameOf(e.leader))}의 시간 초과 → 무작위 원정대 [${e.team.map((id) => esc(nameOf(id))).join(', ')}]</li>`;
       return '';
     }).join('');
     return `<section class="card"><h2>기록</h2><ul class="log">${items}</ul></section>`;
@@ -849,6 +959,179 @@
     else if (!app.view) root.innerHTML = renderConnecting();
     else if (app.view.phase === 'lobby') root.innerHTML = renderLobby(app.view);
     else root.innerHTML = renderGame(app.view);
+    renderChat();
+    updateTimers();
+  }
+
+  /* ---------------- 상태 갱신 시 처리 (타이머·이펙트·내 차례 알림) ---------------- */
+  function setView(v) {
+    const prev = app.view;
+    app.view = v;
+    app.deadlineAt = v.timeLeft != null ? Date.now() + v.timeLeft : null;
+    if (prev && prev.gameNo === v.gameNo && v.phase !== 'lobby' && prev.phase !== 'lobby') {
+      const pv = prev.lastVote;
+      const nv = v.lastVote;
+      if (nv && (!pv || pv.q !== nv.q || pv.attempt !== nv.attempt)) {
+        toast(nv.approved ? `🗳 원정대 가결! 퀘스트 ${nv.q}를 떠납니다.` : `🗳 원정대 부결 (${v.rejectCount}/5) · 대표가 넘어갑니다.`);
+      }
+      if (v.results.length > prev.results.length) queueFx({ type: 'quest', r: v.results[v.results.length - 1] });
+      if (v.phase === 'end' && prev.phase !== 'end') queueFx({ type: 'end', winner: v.winner });
+    }
+    if (prev && prev.phase === 'lobby' && v.phase !== 'lobby') { app.roleHidden = true; queueFx({ type: 'start' }); }
+    const key = myTurnKey(v);
+    if (key && key !== app.turnKey) { try { if (navigator.vibrate) navigator.vibrate([120, 60, 120]); } catch (e) { /* ignore */ } }
+    app.turnKey = key;
+    document.title = key ? '🔔 내 차례 · 아발론 온라인' : '아발론 온라인';
+  }
+
+  function myTurnKey(v) {
+    const base = `${v.gameNo}-${v.questIdx}-${v.rejectCount}-${v.phase}`;
+    if (v.phase === 'propose' && v.leaderId === v.me) return base;
+    if (v.phase === 'vote' && v.myVote === null && v.myRole) return base;
+    if (v.phase === 'quest' && v.team.includes(v.me) && !v.questDone.includes(v.me)) return base;
+    if (v.phase === 'lady' && v.lady && v.lady.holder === v.me) return base;
+    if (v.phase === 'assassin' && v.myRole === 'assassin') return base;
+    return '';
+  }
+
+  /* ---------------- 제한 시간 표시 ---------------- */
+  function updateTimers() {
+    const els = document.querySelectorAll('[data-timer]');
+    if (!els.length) return;
+    const left = app.deadlineAt ? Math.max(0, app.deadlineAt - Date.now()) : 0;
+    const sec = Math.ceil(left / 1000);
+    const text = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+    els.forEach((e) => { e.textContent = text; e.classList.toggle('low', sec <= 30); });
+  }
+  setInterval(updateTimers, 250);
+
+  /* ---------------- 퀘스트 결과 이펙트 ---------------- */
+  let fxTimer = null;
+  function queueFx(f) {
+    app.fxQueue.push(f);
+    if (!app.fxBusy) nextFx();
+  }
+  function shuffled(a) {
+    const r = a.slice();
+    for (let i = r.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [r[i], r[j]] = [r[j], r[i]]; }
+    return r;
+  }
+  function particles(kind, count) {
+    let h = '';
+    for (let i = 0; i < count; i++) {
+      const x = Math.round(Math.random() * 100);
+      const d = (Math.random() * 1.2).toFixed(2);
+      const s = (0.6 + Math.random() * 0.9).toFixed(2);
+      const dx = Math.round((Math.random() - 0.5) * 120);
+      h += `<i class="pt ${kind}" style="left:${x}%;--pd:${d}s;--ps:${s};--dx:${dx}px"></i>`;
+    }
+    return h;
+  }
+  function nextFx() {
+    clearTimeout(fxTimer);
+    const el = $('#fx');
+    const f = app.fxQueue.shift();
+    if (!f) { app.fxBusy = false; el.hidden = true; el.innerHTML = ''; return; }
+    app.fxBusy = true;
+    let html = '';
+    let dur = 3000;
+    if (f.type === 'quest') {
+      const r = f.r;
+      const cards = shuffled(Array(r.team.length - r.fails).fill(true).concat(Array(r.fails).fill(false)));
+      const step = 0.4;
+      const tDelay = 0.4 + cards.length * step + 0.2;
+      html = `<div class="fx-wrap ${r.success ? 'win' : 'lose'}" style="--td:${tDelay}s">
+        <div class="fx-flash"></div>
+        <div class="fx-label">퀘스트 ${r.q} 결과 공개</div>
+        <div class="fx-cards">${cards.map((c, i) => `<div class="fcard" style="--d:${(0.4 + i * step).toFixed(2)}s"><div class="fin"><div class="fback">⚔</div><div class="ffront ${c ? 's' : 'f'}">${c ? '✓' : '✗'}<small>${c ? '성공' : '실패'}</small></div></div></div>`).join('')}</div>
+        <div class="fx-title">${r.success ? '🛡️ 퀘스트 성공!' : '💥 퀘스트 실패…'}</div>
+        <div class="fx-sub">실패 카드 ${r.fails}장${r.need === 2 ? ' · 이번 퀘스트는 2장이 있어야 실패' : ''}</div>
+        <div class="fx-parts">${r.success ? particles('gold', 36) : particles('ember', 30)}</div>
+        <div class="fx-skip">탭하면 닫힙니다</div>
+      </div>`;
+      dur = (tDelay + 2.8) * 1000;
+    } else if (f.type === 'end') {
+      const good = f.winner === 'good';
+      html = `<div class="fx-wrap end ${good ? 'win' : 'lose'}" style="--td:.2s">
+        <div class="fx-flash"></div>
+        <div class="fx-title huge">${good ? '🛡️ 선의 세력 승리!' : '🗡️ 악의 세력 승리!'}</div>
+        <div class="fx-sub">${good ? '아서 왕의 충신들이 원정을 지켜냈습니다' : '모드레드의 하수인들이 원정을 무너뜨렸습니다'}</div>
+        <div class="fx-parts">${good ? particles('gold', 50) + particles('blue', 30) : particles('ember', 50)}</div>
+        <div class="fx-skip">탭하면 닫힙니다</div>
+      </div>`;
+      dur = 4200;
+    } else if (f.type === 'start') {
+      html = `<div class="fx-wrap start" style="--td:.1s">
+        <div class="fx-title">⚔️ 게임 시작</div>
+        <div class="fx-sub">비밀 역할이 배정되었습니다. "내 역할 확인하기"를 눌러 확인하세요.</div>
+        <div class="fx-skip">탭하면 닫힙니다</div>
+      </div>`;
+      dur = 2400;
+    }
+    el.innerHTML = html;
+    el.hidden = false;
+    fxTimer = setTimeout(nextFx, dur);
+  }
+
+  /* ---------------- 채팅 ---------------- */
+  function chatMsgs() {
+    return app.mode === 'host' && app.state ? app.state.chat : app.chat;
+  }
+  function nameColor(name) {
+    let h = 0;
+    for (const ch of String(name)) h = (h * 31 + ch.charCodeAt(0)) % 360;
+    return `hsl(${h} 70% 72%)`;
+  }
+  function renderChat() {
+    const box = $('#chat');
+    if (!box) return;
+    const show = app.mode !== 'home' && !!app.view;
+    box.hidden = !show;
+    if (!show) return;
+    $('#chatPanel').hidden = !app.chatOpen;
+    $('#chatFab').hidden = app.chatOpen;
+    const badge = $('#chatBadge');
+    badge.hidden = !app.unread;
+    badge.textContent = app.unread > 99 ? '99+' : String(app.unread);
+    if (app.chatOpen) renderChatList(false);
+  }
+  function renderChatList(forceBottom) {
+    const el = $('#chatList');
+    if (!el) return;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    const me = app.view ? app.view.me : app.cid;
+    const msgs = chatMsgs();
+    el.innerHTML = msgs.length ? msgs.map((m) => {
+      const t = new Date(m.ts);
+      const hm = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+      if (m.sys) return `<div class="cm sys">${esc(m.text)}</div>`;
+      const mine = m.pid === me;
+      return `<div class="cm ${mine ? 'mine' : ''}">
+        ${mine ? '' : `<div class="cname" style="color:${nameColor(m.name)}">${esc(m.name)}</div>`}
+        <div class="cbody"><span class="bubble">${esc(m.text)}</span><span class="ctime">${hm}</span></div>
+      </div>`;
+    }).join('') : '<div class="cm sys">아직 대화가 없습니다. 첫 인사를 건네보세요!</div>';
+    if (near || forceBottom) el.scrollTop = el.scrollHeight;
+  }
+  function onChatAdded(msgs) {
+    const me = app.view ? app.view.me : app.cid;
+    if (!app.chatOpen) app.unread += msgs.filter((m) => !m.sys && m.pid !== me).length;
+    renderChat();
+  }
+  function sendChat() {
+    const input = $('#chatInput');
+    const text = input.value.replace(/\s+/g, ' ').trim();
+    if (!text) return;
+    act('chat', { text: text.slice(0, A.CHAT_MAX_LEN) });
+    input.value = '';
+    input.focus();
+    setTimeout(() => renderChatList(true), 50);
+  }
+  function toggleChat(open) {
+    app.chatOpen = open == null ? !app.chatOpen : open;
+    if (app.chatOpen) app.unread = 0;
+    renderChat();
+    if (app.chatOpen) { renderChatList(true); const i = $('#chatInput'); if (i && window.innerWidth > 700) i.focus(); }
   }
 
   /* ---------------- 이벤트 ---------------- */
@@ -903,7 +1186,11 @@
         render();
         break;
       }
+      case 'chatToggle': toggleChat(); break;
+      case 'chatSend': sendChat(); break;
+      case 'fxSkip': nextFx(); break;
       case 'propose': act('propose', { team: app.selection.slice() }); break;
+      case 'extend': if (confirm('Last 5분을 사용할까요? 이번 턴에 한 번만 쓸 수 있습니다.')) act('extend'); break;
       case 'vote': act('vote', { approve: el.dataset.v === '1' }); break;
       case 'quest': act('quest', { success: el.dataset.v === '1' }); break;
       case 'lady':
@@ -922,6 +1209,13 @@
   });
 
   document.addEventListener('keydown', (e) => {
+    if (e.target.id === 'chatInput' && e.key === 'Enter') {
+      if (e.isComposing || e.keyCode === 229) return; // 한글 조합 중
+      e.preventDefault();
+      sendChat();
+      return;
+    }
+    if (e.key === 'Escape' && app.chatOpen) { toggleChat(false); return; }
     if (e.key !== 'Enter' || app.mode !== 'home') return;
     if (e.target.id === 'codeInput') $('[data-act="join"]').click();
   });

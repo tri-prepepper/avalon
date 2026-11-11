@@ -36,6 +36,10 @@
     minion: { name: '모드레드의 하수인', team: 'evil', desc: '다른 악의 세력을 알고 있습니다(오베론 제외). 정체를 숨기고 퀘스트를 실패시키세요.' },
   };
 
+  const PROPOSE_MS = 5 * 60 * 1000; // 대표의 원정대 구성 제한 시간
+  const EXTEND_MS = 5 * 60 * 1000; // Last 5분
+  const CHAT_MAX_LEN = 200;
+
   const OPTIONAL_GOOD = ['percival'];
   const OPTIONAL_EVIL = ['morgana', 'mordred', 'oberon'];
 
@@ -79,7 +83,22 @@
       reason: '',
       assassinTarget: null,
       gameNo: 0,
+      deadline: null,
+      extendUsed: false,
+      chat: [],
     };
+  }
+
+  function sys(s, text) {
+    s.chat = s.chat || [];
+    s.chat.push({ n: s.chat.length, sys: true, text, ts: Date.now() });
+  }
+
+  function enterPropose(s) {
+    s.phase = 'propose';
+    s.team = [];
+    s.deadline = Date.now() + PROPOSE_MS;
+    s.extendUsed = false;
   }
 
   function buildRoles(n, settings) {
@@ -125,13 +144,17 @@
     let k = 2;
     while (s.players.some((p) => p.name === finalName)) finalName = `${name}${k++}`;
     s.players.push({ id, name: finalName, connected: true });
+    sys(s, `${finalName}님이 입장했습니다.`);
     return { pid: id };
   }
 
   function disconnect(s, pid) {
     const i = s.players.findIndex((p) => p.id === pid);
     if (i < 0) return;
-    if (s.phase === 'lobby' && pid !== s.hostId) s.players.splice(i, 1);
+    if (s.phase === 'lobby' && pid !== s.hostId) {
+      sys(s, `${s.players[i].name}님이 나갔습니다.`);
+      s.players.splice(i, 1);
+    }
     else s.players[i].connected = false;
   }
 
@@ -154,6 +177,8 @@
     s.winner = winner;
     s.reason = reason;
     s.team = [];
+    s.deadline = null;
+    sys(s, `🏁 ${winner === 'good' ? '선의 세력 승리' : '악의 세력 승리'} — ${reason}`);
     return null;
   }
 
@@ -186,7 +211,8 @@
     } else {
       s.lady = null;
     }
-    s.phase = 'propose';
+    enterPropose(s);
+    sys(s, `⚔️ 게임 ${s.gameNo}이(가) 시작되었습니다. 첫 대표는 ${nameOf(s, leaderId(s))}님입니다.`);
     return null;
   }
 
@@ -207,6 +233,8 @@
     s.rejectCount = 0;
     s.questIdx = 0;
     s.aliases = {};
+    s.deadline = null;
+    sys(s, '대기실로 돌아왔습니다.');
     return null;
   }
 
@@ -221,6 +249,7 @@
     s.log.push(rec);
     s.lastVote = rec;
     s.votes = {};
+    sys(s, `🗳 퀘스트 ${rec.q} · ${nameOf(s, rec.leader)}의 원정대 [${rec.team.map((id) => nameOf(s, id)).join(', ')}] ${approved ? '가결' : '부결'} (찬성 ${approvals} / 반대 ${n - approvals})`);
     if (approved) {
       s.rejectCount = 0;
       s.questCards = {};
@@ -230,8 +259,7 @@
     s.rejectCount += 1;
     if (s.rejectCount >= 5) return end(s, 'evil', '원정대 제안이 5번 연속 부결되어 악의 세력이 승리했습니다.');
     nextLeader(s);
-    s.team = [];
-    s.phase = 'propose';
+    enterPropose(s);
     return null;
   }
 
@@ -243,6 +271,7 @@
     const rec = { t: 'quest', q: s.questIdx + 1, team: s.team.slice(), fails, need, success };
     s.results.push(rec);
     s.log.push(rec);
+    sys(s, `${success ? '✅' : '❌'} 퀘스트 ${rec.q} ${success ? '성공' : '실패'} (실패 카드 ${fails}장)`);
     s.questCards = {};
     const wins = s.results.filter((r) => r.success).length;
     const losses = s.results.length - wins;
@@ -255,7 +284,7 @@
     s.questIdx += 1;
     nextLeader(s);
     s.team = [];
-    s.phase = s.lady && s.results.length >= 2 ? 'lady' : 'propose';
+    if (s.lady && s.results.length >= 2) { s.phase = 'lady'; s.deadline = null; } else enterPropose(s);
     return null;
   }
 
@@ -299,6 +328,23 @@
         s.team = team;
         s.votes = {};
         s.phase = 'vote';
+        s.deadline = null;
+        return null;
+      }
+      case 'extend': {
+        if (s.phase !== 'propose') return '지금은 시간을 늘릴 수 없습니다.';
+        if (leaderId(s) !== pid) return '대표만 Last 5분을 사용할 수 있습니다.';
+        if (s.extendUsed) return '이번 턴에는 이미 Last 5분을 사용했습니다.';
+        s.extendUsed = true;
+        s.deadline = (s.deadline || Date.now()) + EXTEND_MS;
+        sys(s, `⏱ ${nameOf(s, pid)}님이 Last 5분을 사용했습니다.`);
+        return null;
+      }
+      case 'chat': {
+        const text = String(p.text || '').replace(/\s+/g, ' ').trim().slice(0, CHAT_MAX_LEN);
+        if (!text) return '메시지를 입력해주세요.';
+        s.chat = s.chat || [];
+        s.chat.push({ n: s.chat.length, pid, name: nameOf(s, pid), text, ts: Date.now() });
         return null;
       }
       case 'vote': {
@@ -328,7 +374,8 @@
         s.log.push({ t: 'lady', holder: pid, target: t });
         s.lady.used.push(t);
         s.lady.holder = t;
-        s.phase = 'propose';
+        sys(s, `🌊 ${nameOf(s, pid)}님이 ${nameOf(s, t)}님의 진영을 확인했습니다.`);
+        enterPropose(s);
         return null;
       }
       case 'assassinate': {
@@ -343,6 +390,22 @@
       default:
         return '알 수 없는 행동입니다.';
     }
+  }
+
+  // 제한 시간 초과 처리. 상태가 바뀌면 true
+  function tick(s, now) {
+    if (s.phase !== 'propose' || !s.deadline || (now || Date.now()) < s.deadline) return false;
+    const n = s.players.length;
+    const size = QUEST_SIZES[n][s.questIdx];
+    const team = shuffle(s.players.map((p) => p.id)).slice(0, size);
+    const leader = leaderId(s);
+    s.log.push({ t: 'auto', q: s.questIdx + 1, leader, team: team.slice() });
+    sys(s, `⏰ ${nameOf(s, leader)}님의 시간이 초과되어 원정대가 무작위로 선택되었습니다: ${team.map((id) => nameOf(s, id)).join(', ')}`);
+    s.team = team;
+    s.votes = {};
+    s.phase = 'vote';
+    s.deadline = null;
+    return true;
   }
 
   function knowledgeFor(s, pid) {
@@ -399,6 +462,8 @@
       reason: s.reason,
       assassinTarget: s.assassinTarget,
       sizes: QUEST_SIZES[n] || null,
+      timeLeft: s.phase === 'propose' && s.deadline ? Math.max(0, s.deadline - Date.now()) : null,
+      extendUsed: !!s.extendUsed,
     };
     if (inGame && s.roles[pid]) {
       v.myRole = s.roles[pid];
@@ -412,7 +477,8 @@
 
   const api = {
     MIN_PLAYERS, MAX_PLAYERS, COMPOSITION, QUEST_SIZES, ROLES,
-    failsNeeded, buildRoles, createRoom, join, disconnect, applyAction, viewFor, resolveId,
+    PROPOSE_MS, EXTEND_MS, CHAT_MAX_LEN,
+    failsNeeded, buildRoles, createRoom, join, disconnect, applyAction, viewFor, resolveId, tick,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Avalon = api;
